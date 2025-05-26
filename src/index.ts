@@ -32,7 +32,7 @@ async function refreshAccessToken(env) {
 }
 
 async function getValidToken(env) {
-	const MINUTE = 60000;
+    const MINUTE = 60000;
     const EXPIRY_BUFFER_MS = MINUTE * 20;
     
     // Check KV for stored token
@@ -51,10 +51,10 @@ async function getValidToken(env) {
     return newToken.access_token;
 }
 
-function asciiSafe(s:string) {
-	return s.replace(/[\u007F-\uFFFF]/g, function(chr) {
-		return "\\u" + ("0000" + chr.charCodeAt(0).toString(16)).substr(-4)
-	});
+function asciiSafe(s: string) {
+    return s.replace(/[\u007F-\uFFFF]/g, function(chr) {
+        return "\\u" + ("0000" + chr.charCodeAt(0).toString(16)).substr(-4);
+    });
 }
 
 export default {
@@ -70,7 +70,8 @@ export default {
     async scheduled(event, env, ctx) {
         const sourceFolder = '/Tulostus/Järjestelmä';
         const targetFolder = '/Tulostettavat iltarastikartat';
-        const entries = ['a-rata.jpg', 'b-rata.jpg', 'c-rata.jpg', 'opetusrata.jpg', 'kaikki rastit.jpg'];
+        const archiveFolder = '/Tulostettavat iltarastikartat/Arkisto';
+        const jpgEntries = ['a-rata.jpg', 'b-rata.jpg', 'c-rata.jpg', 'opetusrata.jpg', 'kaikki rastit.jpg'];
 
         // Get valid access token
         const accessToken = await getValidToken(env);
@@ -131,24 +132,188 @@ export default {
                 }
 
                 console.log(`Successfully streamed ${source} to ${target}`);
+                return true;
             } catch (error) {
                 console.error(`Error streaming ${source} to ${target}:`, error);
+                return false;
             }
         };
 
-        const forward = async (file) => {
+        // Delete a file or folder
+        const deletePath = async (path) => {
+            try {
+                const response = await fetch('https://api.dropboxapi.com/2/files/delete_v2', {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ path }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Failed to delete ${path}: ${response.status}`);
+                }
+
+                console.log(`Successfully deleted ${path}`);
+                return true;
+            } catch (error) {
+                console.error(`Error deleting ${path}:`, error);
+                return false;
+            }
+        };
+
+        // Handle JPG files
+        const forwardJpg = async (file) => {
             const source = `${sourceFolder}/${file}`;
             const target = `${targetFolder}/${file}`;
             const sourceModTime = await getFileMetadata(source);
-            const targetModTime = await getFileMetadata(target);
+            let targetModTime = await getFileMetadata(target);
 
-            if (sourceModTime && (!targetModTime || sourceModTime > targetModTime)) {
-                await streamFile(source, target);
+            if (!sourceModTime) {
+                console.log(`Skipping JPG ${source}: source file does not exist`);
+                return;
+            }
+
+            if (!targetModTime || sourceModTime > targetModTime) {
+                const success = await streamFile(source, target);
+                if (success) {
+                    targetModTime = sourceModTime; // After successful transfer, target has source's mod time
+                } else {
+                    console.log(`Not deleting ${source}: transfer failed`);
+                    return;
+                }
             } else {
-                console.log('Skipping', { source, sourceModTime, targetModTime });
+                console.log('Skipping JPG transfer', { source, sourceModTime, targetModTime });
+            }
+
+            // Delete source if target exists and is at least as recent
+            if (targetModTime && targetModTime >= sourceModTime) {
+                const deleted = await deletePath(source);
+                if (!deleted) {
+                    console.log(`Failed to delete ${source}, but target copy is recent`);
+                }
+            } else {
+                console.log(`Not deleting ${source}: target copy is not recent`);
             }
         };
 
-        await Promise.all(entries.map(forward));
+        // List subfolders in sourceFolder
+        const listFolder = async (folderPath) => {
+            try {
+                const response = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ path: folderPath }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Failed to list folder ${folderPath}: ${response.status}`);
+                }
+
+                const data = await response.json();
+                return data.entries;
+            } catch (error) {
+                console.error(`Error listing folder ${folderPath}:`, error);
+                return [];
+            }
+        };
+
+        // Check if folder exists
+        const folderExists = async (folderPath) => {
+            try {
+                const response = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ path: folderPath }),
+                });
+
+                if (!response.ok) {
+                    if (response.status === 409) return false; // Folder doesn't exist
+                    throw new Error(`Failed to check folder ${folderPath}: ${response.status}`);
+                }
+
+                const data = await response.json();
+                return data['.tag'] === 'folder';
+            } catch (error) {
+                console.error(`Error checking folder ${folderPath}:`, error);
+                return false;
+            }
+        };
+
+        // Handle PDF files in year-prefixed subfolders
+        const forwardPdfs = async () => {
+            const subfolders = await listFolder(sourceFolder);
+            const yearRegex = /^20[0-9][0-9]$/;
+
+            for (const entry of subfolders) {
+                if (entry['.tag'] !== 'folder') continue;
+                const year = entry.name.split('-')[0]; // Extract year from folder name (e.g., "2023-something")
+                if (!yearRegex.test(year)) continue;
+
+                const subfolderPath = `${sourceFolder}/${entry.name}`;
+                const archiveYearFolder = `${archiveFolder}/${year}`;
+                const archiveSubfolder = `${archiveYearFolder}/${entry.name}`;
+
+                // Check if archive year folder and subfolder exist
+                const yearFolderExists = await folderExists(archiveYearFolder);
+                if (!yearFolderExists) {
+                    console.log(`Skipping subfolder ${subfolderPath}: archive year folder ${archiveYearFolder} does not exist`);
+                    continue;
+                }
+
+                const subfolderExists = await folderExists(archiveSubfolder);
+                if (!subfolderExists) {
+                    console.log(`Skipping subfolder ${subfolderPath}: archive subfolder ${archiveSubfolder} does not exist`);
+                    continue;
+                }
+
+                // List PDF files in subfolder
+                const files = await listFolder(subfolderPath);
+                const pdfFiles = files.filter(file => file['.tag'] === 'file' && file.name.toLowerCase().endsWith('.pdf'));
+                let allProcessedSuccessfully = true;
+
+                for (const file of pdfFiles) {
+                    const source = `${subfolderPath}/${file.name}`;
+                    const target = `${archiveSubfolder}/${file.name}`;
+                    const sourceModTime = await getFileMetadata(source);
+                    const targetModTime = await getFileMetadata(target);
+
+                    if (sourceModTime && (!targetModTime || sourceModTime > targetModTime)) {
+                        const success = await streamFile(source, target);
+                        if (!success) {
+                            allProcessedSuccessfully = false;
+                        }
+                    } else {
+                        console.log('Skipping PDF', { source, sourceModTime, targetModTime });
+                        // If skipped because target is newer or exists, consider it processed
+                    }
+                }
+
+                // Delete source subfolder if all PDFs were processed successfully
+                if (allProcessedSuccessfully && pdfFiles.length > 0) {
+                    const deleted = await deletePath(subfolderPath);
+                    if (!deleted) {
+                        console.log(`Failed to delete subfolder ${subfolderPath}, but PDFs were processed`);
+                    }
+                } else if (pdfFiles.length === 0) {
+                    console.log(`No PDFs found in ${subfolderPath}, skipping deletion`);
+                } else {
+                    console.log(`Not deleting ${subfolderPath} due to processing errors`);
+                }
+            }
+        };
+
+        // Execute both JPG and PDF forwarding
+        await Promise.all([
+            ...jpgEntries.map(forwardJpg),
+            forwardPdfs(),
+        ]);
     },
 } satisfies ExportedHandler<Env>;
