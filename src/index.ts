@@ -32,7 +32,8 @@ async function refreshAccessToken(env) {
 }
 
 async function getValidToken(env) {
-    const EXPIRY_BUFFER_MS = 600000; // 10 minutes buffer (600,000 ms)
+	const MINUTE = 60000;
+    const EXPIRY_BUFFER_MS = MINUTE * 20;
     
     // Check KV for stored token
     const stored = await env.STATE.get('dropbox_access_token', { type: 'json' });
