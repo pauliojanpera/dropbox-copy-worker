@@ -18,7 +18,10 @@
 	"kv_namespaces": [{
       "binding": "STATE",
       "id": "f101f3a486764b9e8d0ad13b7c2b4c87"
-    }]
+    }],
+	"vars": {
+		"DROPBOX_CLIENT_ID": "w6ol0q8x42ic8sb"
+	}
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
